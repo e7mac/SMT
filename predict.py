@@ -96,8 +96,8 @@ class Predictor(BasePredictor):
         if img is None:
             raise ValueError(f"Could not load image from {image}")
 
-        # # Preprocess image (resize and pad for model compatibility)
-        # img = preprocess_image(img)
+        # Preprocess image (resize and pad for model compatibility)
+        img = preprocess_image(img)
 
         # Convert to tensor
         img_tensor = convert_img_to_tensor(img).unsqueeze(0).to(self.device)
