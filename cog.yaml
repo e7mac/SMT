@@ -12,5 +12,6 @@ build:
     - scikit-image
     - timm
     - loguru
+    - verovio>=4.0.0
 
 predict: "predict.py:Predictor"

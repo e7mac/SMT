@@ -3,9 +3,8 @@
 from cog import BasePredictor, Input, Path
 import torch
 import cv2
-import numpy as np
-from PIL import Image
-from torchvision import transforms
+import tempfile
+import verovio
 from data_augmentation.data_augmentation import convert_img_to_tensor
 
 from smt_model import SMTModelForCausalLM
@@ -15,7 +14,6 @@ MODEL_CHOICES = {
     "grandstaff": "antoniorv6/smt-grandstaff",
     "camera-grandstaff": "antoniorv6/smt-camera-grandstaff",
 }
-
 
 
 def preprocess_image(img, max_height=256, max_width=3056):
@@ -33,10 +31,6 @@ def preprocess_image(img, max_height=256, max_width=3056):
         new_h = int(h * scale)
         new_w = int(w * scale)
         img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    else:
-        # If image is smaller, we may need to scale up to avoid being too small
-        # But for sheet music, we typically scale down, not up
-        pass
 
     # Ensure dimensions are divisible by 16 (the model's reduction factor)
     h, w = img.shape[:2]
@@ -51,6 +45,13 @@ def preprocess_image(img, max_height=256, max_width=3056):
         )
 
     return img
+
+
+def kern_to_musicxml(kern_string: str) -> str:
+    """Convert Humdrum kern notation to MusicXML using verovio."""
+    tk = verovio.toolkit()
+    tk.loadData(kern_string)
+    return tk.renderToMusicXml()
 
 
 class Predictor(BasePredictor):
@@ -85,11 +86,11 @@ class Predictor(BasePredictor):
             choices=["grandstaff", "camera-grandstaff"],
         ),
         output_format: str = Input(
-            description="Output format: 'formatted' for human-readable, 'raw' for tokens",
-            default="formatted",
-            choices=["formatted", "raw"],
+            description="Output format: 'musicxml' for MusicXML file, 'kern' for Humdrum kern text",
+            default="musicxml",
+            choices=["musicxml", "kern"],
         ),
-    ) -> str:
+    ) -> Path:
         """Transcribe sheet music image to symbolic notation."""
         # Load image
         img = cv2.imread(str(image))
@@ -109,10 +110,19 @@ class Predictor(BasePredictor):
         with torch.no_grad():
             predictions, _ = model_instance.predict(img_tensor, convert_to_str=True)
 
-        # Format output
-        if output_format == "formatted":
-            result = "".join(predictions)
-            result = result.replace("<b>", "\n").replace("<s>", " ").replace("<t>", "\t")
-            return result
+        # Convert tokens to kern format
+        kern_result = "".join(predictions)
+        kern_result = kern_result.replace("<b>", "\n").replace("<s>", " ").replace("<t>", "\t")
+
+        # Output based on format
+        if output_format == "musicxml":
+            musicxml_content = kern_to_musicxml(kern_result)
+            output_path = Path(tempfile.mktemp(suffix=".musicxml"))
+            with open(output_path, "w") as f:
+                f.write(musicxml_content)
+            return output_path
         else:
-            return " ".join(predictions)
+            output_path = Path(tempfile.mktemp(suffix=".krn"))
+            with open(output_path, "w") as f:
+                f.write(kern_result)
+            return output_path
