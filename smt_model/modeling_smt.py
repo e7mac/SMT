@@ -74,6 +74,10 @@ class PositionalEncoding1D(nn.Module):
             return x
 
 class MultiHeadAttention(nn.Module):
+    """Multi-head attention matching the original checkpoint architecture.
+
+    Uses sequence-first format (L, B, C) internally to match the trained weights.
+    """
 
     def __init__(self, d_model:int, num_heads:int, dropout: float = 0.1,
                  bias:bool = True):
@@ -83,137 +87,98 @@ class MultiHeadAttention(nn.Module):
 
         self.d_model = d_model
         self.num_heads = num_heads
-        self.d_head = d_model // num_heads
-        self.scale = self.d_head ** -0.5
+        self.head_dim = d_model // num_heads
+        self.scale_factor = float(self.head_dim) ** -0.5
 
-        self.has_flash_attn = hasattr(F, 'scaled_dot_product_attention')
-        if not self.has_flash_attn:
-            logger.warning("This program cannot run Flash Attention, for optimal computing, check your GPU driver and your PyTorch version")
-
-        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        # Named to match HuggingFace checkpoint: lq, lk, lv
+        self.lq = nn.Linear(d_model, d_model, bias=bias)
+        self.lk = nn.Linear(d_model, d_model, bias=bias)
+        self.lv = nn.Linear(d_model, d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
 
-        self._init_parameters()
-
         self.dropout = nn.Dropout(dropout)
+        self.softmax = nn.Softmax(dim=-1)
 
+    def forward(self,
+                query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                key_pad_mask: Optional[torch.Tensor] = None,
+                attn_mask: Optional[torch.Tensor] = None,
+                return_weights: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            query: (L_tgt, B, C) sequence-first format
+            key: (L_src, B, C) sequence-first format
+            value: (L_src, B, C) sequence-first format
+            key_pad_mask: (B, L_src) padding mask
+            attn_mask: (L_tgt, L_src) attention mask
+            return_weights: whether to return attention weights
+        """
+        target_len, b, c = query.size()
+        source_len = key.size(0)
 
-    def _init_parameters(self):
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
+        q = self.lq(query)
+        k = self.lk(key)
+        v = self.lv(value)
 
+        # Reshape: (L, B, C) -> (L, B*H, D) -> (B*H, L, D)
+        q = q.view(target_len, b * self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.view(source_len, b * self.num_heads, self.head_dim).transpose(0, 1)
+        v = v.view(source_len, b * self.num_heads, self.head_dim).transpose(0, 1)
 
-    def _split_heads(self, tensor:torch.Tensor) -> torch.Tensor:
-        """Split the heads and put them into a batch-first format."""
-        batch_size, seq_len, _ = tensor.shape
-        tensor = tensor.view(batch_size, seq_len, self.num_heads, self.d_head)
-        return tensor.transpose(1,2) # (batch_size, num_heads, seq_len, d_head)
-
-
-    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Merge heads and transpose back to batch-first format."""
-        batch_size = tensor.shape[0]
-        tensor = tensor.transpose(1, 2)
-        return tensor.reshape(batch_size, -1, self.d_model).contiguous()
-
-
-    def compute_flash_attn(self,
-                           q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                           attn_mask:Optional[torch.Tensor] = None):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            if attn_mask is not None:
-                attn_mask = ~attn_mask
-            return F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal = False, scale=self.scale
-            )
-
-    def _compute_regular_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None
-    ):
-        attn_weights = (q @ k.transpose(-2, -1)) * self.scale
+        # Attention: (B*H, L_tgt, D) @ (B*H, D, L_src) -> (B*H, L_tgt, L_src)
+        # Note: Original model was trained WITHOUT scale factor
+        attn_weights = torch.bmm(q, k.transpose(1, 2))
 
         if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(0)
             if attn_mask.dtype == torch.bool:
-                attn_weights.masked_fill_(attn_mask, float('-inf'))
+                attn_weights.masked_fill_(attn_mask, float("-inf"))
             else:
                 attn_weights += attn_mask
 
-        if key_padding_mask is not None:
-            attn_weights.masked_fill_(
-                ~key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
-            )
+        if key_pad_mask is not None:
+            attn_weights = attn_weights.view(b, self.num_heads, target_len, source_len)
+            attn_weights = attn_weights.masked_fill(key_pad_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            attn_weights = attn_weights.view(b * self.num_heads, target_len, source_len)
 
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_probs = self.dropout(attn_weights)
-        attn_output = attn_probs @ v
+        attn_weights_softmax = self.softmax(attn_weights)
+        attn_weights_dropout = self.dropout(attn_weights_softmax)
 
-        return attn_output, attn_weights
+        # (B*H, L_tgt, L_src) @ (B*H, L_src, D) -> (B*H, L_tgt, D)
+        attn_output = torch.bmm(attn_weights_dropout, v)
 
-    def forward(self,
-                query: torch.Tensor, key: Optional[torch.Tensor] = None, value:Optional[torch.Tensor] = None,
-                key_padding_mask: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None,
-                return_weights: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-
-        if key is None and value is None:
-            q = self.q_proj(query)
-            k = self.k_proj(query)
-            v = self.v_proj(query)
-        else:
-            if key is None or value is None:
-                raise ValueError("Both key and value must be provided for cross-attention")
-
-            # We manually multiply each weight section from qkv_proj to their respective vectors
-            q = self.q_proj(query)
-            k = self.k_proj(key)
-            v = self.v_proj(value)
-
-        # Split the heads in q, k and v
-        q = self._split_heads(q)
-        k = self._split_heads(k)
-        v = self._split_heads(v)
-
-        use_flash_attn = self.has_flash_attn and not return_weights
-
-        if use_flash_attn:
-            attn_output = self.compute_flash_attn(q, k, v, attn_mask=attn_mask)
-            attn_weights = None
-        else:
-            attn_output, attn_weights = self._compute_regular_attention(q, k, v, key_padding_mask, attn_mask)
-
-        output = self._merge_heads(attn_output)
-        output = self.out_proj(output)
+        # Reshape back: (B*H, L_tgt, D) -> (L_tgt, B*H, D) -> (L_tgt, B, C)
+        attn_output = attn_output.transpose(0, 1).contiguous().view(target_len, b, c)
+        attn_output = self.out_proj(attn_output)
 
         if return_weights:
-            return output, attn_weights
+            attn_weights_out = attn_weights_softmax.view(b, self.num_heads, target_len, source_len)
+            return attn_output, attn_weights_out.sum(dim=1) / self.num_heads
 
-        return output, None
+        return attn_output, None
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, dim_ff:int,
                  dropout: float = 0.1, activation: str = "relu"):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
-        self.cross_attn = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
+        # Named to match HuggingFace checkpoint
+        self.input_attention = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
+        self.cross_attention = MultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
 
         self.activation = nn.ReLU() if activation.lower() == "relu" else nn.GELU()
 
-        self.ffn = nn.Sequential(
+        # Named ffNet to match checkpoint
+        self.ffNet = nn.Sequential(
             nn.Linear(d_model, dim_ff),
             self.activation,
             nn.Dropout(dropout),
             nn.Linear(dim_ff, d_model)
         )
 
-        self.norm_layers = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(3)])
+        # Named norm1, norm2, norm3 to match checkpoint
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
         self.dropout_layers = nn.ModuleList([nn.Dropout(dropout) for _ in range(3)])
 
     def forward(self,
@@ -224,31 +189,37 @@ class DecoderLayer(nn.Module):
                 tgt_key_padding_mask: Optional[torch.Tensor] = None,
                 memory_key_padding_mask: Optional[torch.Tensor] = None,
                 return_weights=False):
-
-
-        attn_output, self_weights = self.self_attn(
-            query=x, key=None, value=None,
-            key_padding_mask=tgt_key_padding_mask, attn_mask=tgt_mask,
+        """
+        Args:
+            x: (L, B, C) sequence-first decoder input
+            encoder_output_key: (L_enc, B, C) encoder features for key
+            encoder_output_value: (L_enc, B, C) encoder features for value
+        """
+        # Self-attention: query, key, value are all x
+        attn_output, self_weights = self.input_attention(
+            query=x, key=x, value=x,
+            key_pad_mask=tgt_key_padding_mask, attn_mask=tgt_mask,
             return_weights=return_weights
         )
 
         x = x + self.dropout_layers[0](attn_output)
-        x = self.norm_layers[0](x)
+        x = self.norm1(x)
 
-        attn_output, cross_weights = self.cross_attn(
+        # Cross-attention: query is x, key/value from encoder
+        attn_output, cross_weights = self.cross_attention(
             query=x,
             key=encoder_output_key,
             value=encoder_output_value,
-            key_padding_mask=memory_key_padding_mask,
+            key_pad_mask=memory_key_padding_mask,
             return_weights=return_weights
         )
 
         x = x + self.dropout_layers[1](attn_output)
-        x = self.norm_layers[1](x)
+        x = self.norm2(x)
 
-        ffn_output = self.ffn(x)
+        ffn_output = self.ffNet(x)
         x = x + self.dropout_layers[2](ffn_output)
-        x = self.norm_layers[2](x)
+        x = self.norm3(x)
 
         if return_weights:
             return x, [self_weights, cross_weights]
@@ -308,8 +279,11 @@ class Decoder(nn.Module):
 
         self.position_encoding = PositionalEncoding1D(dim=d_model, len_max=max_seq_length)
 
-        self.vocab_projection = nn.Linear(in_features=d_model, out_features=out_categories)
+        # Conv1d with kernel_size=1 to match checkpoint weight shape [out, in, 1]
+        self.out_layer = nn.Conv1d(in_channels=d_model, out_channels=out_categories, kernel_size=1)
 
+        # Original has ReLU before output layer
+        self.end_relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, decoder_input:torch.Tensor,
@@ -318,9 +292,20 @@ class Decoder(nn.Module):
                 tgt_key_padding_mask:Optional[torch.Tensor] = None,
                 memory_key_padding_mask:Optional[torch.Tensor] = None,
                 return_weights = False):
-
+        """
+        Args:
+            decoder_input: (B, L) token indices
+            encoder_output_2D: (B, L_enc, C) encoder features with 2D pos encoding
+            encoder_output_raw: (B, L_enc, C) raw encoder features
+        """
+        # Embed: (B, L) -> (B, L, C)
         decoder_input = self.embedding(decoder_input)
         decoder_input = self.position_encoding(decoder_input)
+
+        # Convert to sequence-first for transformer: (B, L, C) -> (L, B, C)
+        decoder_input = decoder_input.permute(1, 0, 2)
+        encoder_output_2D = encoder_output_2D.permute(1, 0, 2)
+        encoder_output_raw = encoder_output_raw.permute(1, 0, 2)
 
         output, weights = self.decoder(x=decoder_input, encoder_output_2D=encoder_output_2D,
                                        encoder_output_raw=encoder_output_raw,
@@ -328,9 +313,19 @@ class Decoder(nn.Module):
                                        memory_key_padding_mask=memory_key_padding_mask,
                                        return_weights=return_weights)
 
-        output = self.dropout(output)
+        # Apply ReLU and dropout (matching original: dpoutput = self.dropout(self.end_relu(output)))
+        # Output is in (L, B, C) format
+        output = self.dropout(self.end_relu(output))
 
-        predictions = self.vocab_projection(output)
+        # Conv1d expects (B, C, L), output is (L, B, C)
+        # Original: predictions = self.out_layer(dpoutput.permute(1,2,0).contiguous())
+        predictions = self.out_layer(output.permute(1, 2, 0).contiguous())
+
+        # Convert predictions to (B, L, C) for return
+        predictions = predictions.permute(0, 2, 1)
+
+        # Convert output to batch-first: (L, B, C) -> (B, L, C)
+        output = output.permute(1, 0, 2)
 
         return output, predictions, weights
 
@@ -372,13 +367,14 @@ class SMTModelForCausalLM(PreTrainedModel):
         encoder_output_2D = self.pos2D(encoder_output)
         encoder_features = torch.flatten(encoder_output, start_dim=2, end_dim=3).permute(0, 2, 1)
         encoder_features_2D = torch.flatten(encoder_output_2D, start_dim=2, end_dim=3).permute(0, 2, 1)
-        key_target_mask = self._generate_token_mask([lp.shape[0] for lp in last_predictions], last_predictions.size(), device=last_predictions.device)
+        # Note: For inference with batch_size=1, padding mask is not needed
+        # key_target_mask = self._generate_token_mask([lp.shape[0] for lp in last_predictions], last_predictions.size(), device=last_predictions.device)
         causal_mask = self._generate_causal_mask(last_predictions.size(1), last_predictions.device)
 
         output, predictions, weights = self.decoder(decoder_input=last_predictions,
                                                     encoder_output_2D=encoder_features_2D, encoder_output_raw=encoder_features,
-                                                    tgt_mask=causal_mask, tgt_key_padding_mask=key_target_mask,
-                                                    memory_key_padding_mask=None, #[TODO] This only works with one sample per batch
+                                                    tgt_mask=causal_mask, tgt_key_padding_mask=None,
+                                                    memory_key_padding_mask=None,
                                                     return_weights=return_weights)
 
         return SMTOutput(

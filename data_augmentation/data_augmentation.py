@@ -23,7 +23,7 @@ def augment(image):
         dilation_erosion = Dilation((kernel_w, kernel_h),1)
 
     transform = transforms.Compose(
-        [   
+        [
             transforms.ToPILImage(),
             transforms.RandomPerspective(distortion_scale=distortion_perspective, p=0.2, interpolation=Image.BILINEAR, fill=255),
             transforms.RandomApply([ElasticDistortion(grid=(elastic_dist_kernel, elastic_dist_kernel), magnitude=(magnitude_w, magnitude_h), min_sep=(1,1))], p=0.2),
@@ -35,7 +35,7 @@ def augment(image):
             transforms.ToTensor()
         ]
     )
-    
+
     image = transform(image)
 
     return image

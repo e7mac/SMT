@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from data_augmentation.data_augmentation import convert_img_to_tensor
 
 from smt_model import SMTModelForCausalLM
 
@@ -15,15 +16,6 @@ MODEL_CHOICES = {
     "camera-grandstaff": "antoniorv6/smt-camera-grandstaff",
 }
 
-
-def convert_img_to_tensor(image):
-    """Convert image to grayscale tensor."""
-    transform = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Grayscale(),
-        transforms.ToTensor()
-    ])
-    return transform(image)
 
 
 def preprocess_image(img, max_height=256, max_width=3056):
@@ -104,8 +96,8 @@ class Predictor(BasePredictor):
         if img is None:
             raise ValueError(f"Could not load image from {image}")
 
-        # Preprocess image (resize and pad for model compatibility)
-        img = preprocess_image(img)
+        # # Preprocess image (resize and pad for model compatibility)
+        # img = preprocess_image(img)
 
         # Convert to tensor
         img_tensor = convert_img_to_tensor(img).unsqueeze(0).to(self.device)
