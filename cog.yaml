@@ -12,6 +12,6 @@ build:
     - scikit-image
     - timm
     - loguru
-    - verovio>=4.0.0
+    - music21>=9.1.0
 
 predict: "predict.py:Predictor"

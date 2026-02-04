@@ -4,7 +4,7 @@ from cog import BasePredictor, Input, Path
 import torch
 import cv2
 import tempfile
-import verovio
+from music21 import converter
 from data_augmentation.data_augmentation import convert_img_to_tensor
 
 from smt_model import SMTModelForCausalLM
@@ -47,11 +47,10 @@ def preprocess_image(img, max_height=256, max_width=3056):
     return img
 
 
-def kern_to_musicxml(kern_string: str) -> str:
-    """Convert Humdrum kern notation to MusicXML using verovio."""
-    tk = verovio.toolkit()
-    tk.loadData(kern_string)
-    return tk.renderToMusicXml()
+def kern_to_musicxml(kern_string: str, output_path: str) -> None:
+    """Convert Humdrum kern notation to MusicXML using music21."""
+    score = converter.parse(kern_string, format='humdrum')
+    score.write('musicxml', fp=output_path)
 
 
 class Predictor(BasePredictor):
@@ -116,10 +115,8 @@ class Predictor(BasePredictor):
 
         # Output based on format
         if output_format == "musicxml":
-            musicxml_content = kern_to_musicxml(kern_result)
             output_path = Path(tempfile.mktemp(suffix=".musicxml"))
-            with open(output_path, "w") as f:
-                f.write(musicxml_content)
+            kern_to_musicxml(kern_result, str(output_path))
             return output_path
         else:
             output_path = Path(tempfile.mktemp(suffix=".krn"))
