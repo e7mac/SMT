@@ -1,5 +1,7 @@
 """Local test script for SMT model with MusicXML output."""
 
+import glob
+import os
 import torch
 import cv2
 from music21 import converter
@@ -33,27 +35,25 @@ def kern_to_musicxml(kern_string: str, output_path: str) -> None:
     score.write('musicxml', fp=output_path)
 
 
-def main():
-    image_path = "/Users/mayank10/Developer/SMT/input3.png"
+def process_image(image_path: str, model, device: str):
+    """Process a single image and save outputs."""
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    print(f"\n{'='*60}")
+    print(f"Processing: {image_path}")
+    print(f"{'='*60}")
 
     # Load and preprocess image
     img = cv2.imread(image_path)
     if img is None:
-        raise ValueError(f"Could not load image from {image_path}")
+        print(f"Could not load image from {image_path}")
+        return
 
     print(f"Original image size: {img.shape}")
     img = preprocess_image(img)
     print(f"Preprocessed image size: {img.shape}")
 
     # Convert to tensor
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     img_tensor = convert_img_to_tensor(img).unsqueeze(0).to(device)
-    print(f"Tensor shape: {img_tensor.shape}")
-
-    # Load model
-    print("Loading model...")
-    model = SMTModelForCausalLM.from_pretrained("antoniorv6/smt-camera-grandstaff").to(device)
-    model.eval()
 
     # Run prediction
     print("Running prediction...")
@@ -65,22 +65,47 @@ def main():
     kern_result = kern_result.replace("<b>", "\n").replace("<s>", " ").replace("<t>", "\t")
 
     print("\n=== KERN OUTPUT ===")
-    print(kern_result)
+    print(kern_result[:500] + ("..." if len(kern_result) > 500 else ""))
 
     # Save kern file
-    kern_path = "/Users/mayank10/Developer/SMT/test_output.krn"
+    kern_path = f"output_{base_name}.krn"
     with open(kern_path, "w") as f:
         f.write(kern_result)
     print(f"\nKern saved to: {kern_path}")
 
     # Convert to MusicXML
-    print("\nConverting to MusicXML...")
-    musicxml_path = "/Users/mayank10/Developer/SMT/test_output.musicxml"
+    print("Converting to MusicXML...")
+    musicxml_path = f"output_{base_name}.musicxml"
     try:
         kern_to_musicxml(kern_result, musicxml_path)
         print(f"MusicXML saved to: {musicxml_path}")
     except Exception as e:
         print(f"MusicXML conversion failed: {e}")
+
+
+def main():
+    # Find all input*.png files
+    input_files = sorted(glob.glob("input*.png"))
+
+    if not input_files:
+        print("No input*.png files found in current directory")
+        return
+
+    print(f"Found {len(input_files)} input files: {input_files}")
+
+    # Load model once
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nLoading model on {device}...")
+    model = SMTModelForCausalLM.from_pretrained("antoniorv6/smt-camera-grandstaff").to(device)
+    model.eval()
+
+    # Process each image
+    for image_path in input_files:
+        process_image(image_path, model, device)
+
+    print(f"\n{'='*60}")
+    print(f"Done! Processed {len(input_files)} images.")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
