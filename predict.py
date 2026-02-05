@@ -49,6 +49,8 @@ def preprocess_image(img, max_height=256, max_width=3056):
 
 def kern_to_musicxml(kern_string: str, output_path: str) -> None:
     """Convert Humdrum kern notation to MusicXML using music21."""
+    # Convert ekern_1.0 headers to standard kern for music21 compatibility
+    kern_string = kern_string.replace("**ekern_1.0", "**kern")
     score = converter.parse(kern_string, format='humdrum')
     score.write('musicxml', fp=output_path)
 
