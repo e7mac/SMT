@@ -62,11 +62,11 @@ class Predictor(BasePredictor):
         self.models = {}
 
         # Pre-load the default model
-        print("Loading grandstaff model...")
-        self.models["grandstaff"] = SMTModelForCausalLM.from_pretrained(
-            MODEL_CHOICES["grandstaff"]
+        print("Loading camera-grandstaff model...")
+        self.models["camera-grandstaff"] = SMTModelForCausalLM.from_pretrained(
+            MODEL_CHOICES["camera-grandstaff"]
         ).to(self.device)
-        self.models["grandstaff"].eval()
+        self.models["camera-grandstaff"].eval()
 
     def _get_model(self, model_name: str):
         """Get or load a model by name."""
@@ -83,7 +83,7 @@ class Predictor(BasePredictor):
         image: Path = Input(description="Sheet music image to transcribe"),
         model: str = Input(
             description="Model variant to use. 'grandstaff' for clean scanned sheet music, 'camera-grandstaff' for smartphone photos.",
-            default="grandstaff",
+            default="camera-grandstaff",
             choices=["grandstaff", "camera-grandstaff"],
         ),
         output_format: str = Input(

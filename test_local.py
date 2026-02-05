@@ -52,7 +52,7 @@ def main():
 
     # Load model
     print("Loading model...")
-    model = SMTModelForCausalLM.from_pretrained("antoniorv6/smt-grandstaff").to(device)
+    model = SMTModelForCausalLM.from_pretrained("antoniorv6/smt-camera-grandstaff").to(device)
     model.eval()
 
     # Run prediction
